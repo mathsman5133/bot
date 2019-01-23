@@ -19,6 +19,7 @@ from bot.utils.time import parse_rfc1123, time_since
 log = logging.getLogger(__name__)
 
 URL_RE = re.compile(r"(https?://[^\s]+)")
+STAFF = {Roles.helpers, Roles.moderator, Roles.admin, Roles.owner}
 
 
 class WatchInformation(NamedTuple):
@@ -390,6 +391,11 @@ class BigBrother:
         # Note: This function is called from HelperNomination.nominate_command so that the
         # !nominate command does not show up under "BigBrother" in the help embed, but under
         # the header HelperNomination for users with the helper role.
+
+        member = ctx.guild.get_member(user.id)
+        if any(role.id in STAFF for role in member.roles):
+            await ctx.send(f":x: Sorry, {user} is already a staff member!")
+            return
 
         channel_id = Channels.talent_pool
 
