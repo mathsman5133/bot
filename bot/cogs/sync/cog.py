@@ -105,7 +105,7 @@ class Sync:
             # If we got `404`, the user is new. Create them.
             await self.bot.api_client.post('bot/users', json=packed)
 
-    async def on_member_leave(self, member: Member):
+    async def on_member_remove(self, member: Member):
         await self.bot.api_client.put(
             'bot/users/' + str(member.id),
             json={

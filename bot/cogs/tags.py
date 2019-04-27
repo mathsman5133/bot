@@ -4,7 +4,7 @@ import time
 from discord import Colour, Embed
 from discord.ext.commands import Bot, Context, group
 
-from bot.constants import Channels, Cooldowns, Keys, Roles
+from bot.constants import Channels, Cooldowns, Keys, Roles, MODERATION_ROLES
 from bot.converters import TagContentConverter, TagNameConverter
 from bot.decorators import with_role
 from bot.pagination import LinePaginator
@@ -103,7 +103,7 @@ class Tags:
                 )
 
     @tags_group.command(name='set', aliases=('add', 'edit', 's'))
-    @with_role(Roles.admin, Roles.owner, Roles.moderator)
+    @with_role(*MODERATION_ROLES)
     async def set_command(
         self,
         ctx: Context,

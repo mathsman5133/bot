@@ -221,7 +221,7 @@ class Superstarify:
         await ctx.send(embed=embed)
 
     @command(name='unsuperstarify', aliases=('release_nick', 'unstar'))
-    @with_role(Roles.admin, Roles.owner, Roles.moderator)
+    @with_role(*MODERATION_ROLES)
     async def unsuperstarify(self, ctx: Context, member: Member):
         """
         This command will remove the entry from our database, allowing the user

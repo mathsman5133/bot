@@ -13,7 +13,7 @@ from discord.ext.commands import (
 
 from bot import constants
 from bot.cogs.modlog import ModLog
-from bot.constants import Colours, Event, Icons, Roles
+from bot.constants import Colours, Event, Icons, Roles, MODERATION_ROLES
 from bot.converters import ExpirationDate, InfractionSearchQuery
 from bot.decorators import with_role
 from bot.pagination import LinePaginator
@@ -23,7 +23,6 @@ from bot.utils.time import wait_until
 
 log = logging.getLogger(__name__)
 
-MODERATION_ROLES = Roles.owner, Roles.admin, Roles.moderator
 INFRACTION_ICONS = {
     "Mute": Icons.user_mute,
     "Kick": Icons.sign_out,
@@ -43,9 +42,12 @@ def proxy_user(user_id: str) -> Object:
     return user
 
 
+UserTypes = Union[Member, User, proxy_user]
+
+
 class Moderation(Scheduler):
     """
-    Rowboat replacement moderation tools.
+    Server moderation tools.
     """
 
     def __init__(self, bot: Bot):
@@ -70,13 +72,18 @@ class Moderation(Scheduler):
     # region: Permanent infractions
 
     @with_role(*MODERATION_ROLES)
-    @command(name="warn")
-    async def warn(self, ctx: Context, user: Union[User, proxy_user], *, reason: str = None):
+    @command()
+    async def warn(self, ctx: Context, user: UserTypes, *, reason: str = None):
         """
         Create a warning infraction in the database for a user.
-        :param user: accepts user mention, ID, etc.
-        :param reason: The reason for the warning.
+
+        **`user`:** Accepts user mention, ID, etc.
+        **`reason`:** The reason for the warning.
         """
+
+        response_object = await post_infraction(ctx, user, type="warning", reason=reason)
+        if response_object is None:
+            return
 
         notified = await self.notify_infraction(
             user=user,
@@ -98,10 +105,13 @@ class Moderation(Scheduler):
         else:
             await ctx.send(f"{action} ({reason}).")
 
-        if not notified:
-            await self.log_notify_failure(user, ctx.author, "warning")
+        if notified:
+            dm_status = "Sent"
+            log_content = None
+        else:
+            dm_status = "**Failed**"
+            log_content = ctx.author.mention
 
-        # Send a message to the mod log
         await self.mod_log.send_log_message(
             icon_url=Icons.user_warn,
             colour=Colour(Colours.soft_red),
@@ -109,19 +119,32 @@ class Moderation(Scheduler):
             thumbnail=user.avatar_url_as(static_format="png"),
             text=textwrap.dedent(f"""
                 Member: {user.mention} (`{user.id}`)
-                Actor: {ctx.message.author}
+                Actor: {ctx.author}
+                DM: {dm_status}
                 Reason: {reason}
-            """)
+            """),
+            content=log_content,
+            footer=f"ID {response_object['infraction']['id']}"
         )
 
     @with_role(*MODERATION_ROLES)
-    @command(name="kick")
+    @command()
     async def kick(self, ctx: Context, user: Member, *, reason: str = None):
         """
         Kicks a user.
-        :param user: accepts user mention, ID, etc.
-        :param reason: The reason for the kick.
+
+        **`user`:** Accepts user mention, ID, etc.
+        **`reason`:** The reason for the kick.
         """
+
+        if not await self.respect_role_hierarchy(ctx, user, 'kick'):
+            # Ensure ctx author has a higher top role than the target user
+            # Warning is sent to ctx by the helper method
+            return
+
+        response_object = await post_infraction(ctx, user, type="kick", reason=reason)
+        if response_object is None:
+            return
 
         notified = await self.notify_infraction(
             user=user,
@@ -129,12 +152,13 @@ class Moderation(Scheduler):
             reason=reason
         )
 
-        response_object = await post_infraction(ctx, user, type="kick", reason=reason)
-        if response_object is None:
-            return
-
         self.mod_log.ignore(Event.member_remove, user.id)
-        await user.kick(reason=reason)
+
+        try:
+            await user.kick(reason=reason)
+            action_result = True
+        except Forbidden:
+            action_result = False
 
         dm_result = ":incoming_envelope: " if notified else ""
         action = f"{dm_result}:ok_hand: kicked {user.mention}"
@@ -144,29 +168,33 @@ class Moderation(Scheduler):
         else:
             await ctx.send(f"{action} ({reason}).")
 
-        if not notified:
-            await self.log_notify_failure(user, ctx.author, "kick")
+        dm_status = "Sent" if notified else "**Failed**"
+        title = "Member kicked" if action_result else "Member kicked (Failed)"
+        log_content = None if all((notified, action_result)) else ctx.author.mention
 
-        # Send a log message to the mod log
         await self.mod_log.send_log_message(
             icon_url=Icons.sign_out,
             colour=Colour(Colours.soft_red),
-            title="Member kicked",
+            title=title,
             thumbnail=user.avatar_url_as(static_format="png"),
             text=textwrap.dedent(f"""
                 Member: {user.mention} (`{user.id}`)
                 Actor: {ctx.message.author}
+                DM: {dm_status}
                 Reason: {reason}
-            """)
+            """),
+            content=log_content,
+            footer=f"ID {response_object['infraction']['id']}"
         )
 
     @with_role(*MODERATION_ROLES)
-    @command(name="ban")
-    async def ban(self, ctx: Context, user: Union[User, proxy_user], *, reason: str = None):
+    @command()
+    async def ban(self, ctx: Context, user: UserTypes, *, reason: str = None):
         """
         Create a permanent ban infraction in the database for a user.
-        :param user: Accepts user mention, ID, etc.
-        :param reason: The reason for the ban.
+
+        **`user`:** Accepts user mention, ID, etc.
+        **`reason`:** The reason for the ban.
         """
 
         active_bans = await self.bot.api_client.get(
@@ -189,13 +217,14 @@ class Moderation(Scheduler):
             reason=reason
         )
 
-        response_object = await post_infraction(ctx, user, type="ban", reason=reason)
-        if response_object is None:
-            return
-
         self.mod_log.ignore(Event.member_ban, user.id)
         self.mod_log.ignore(Event.member_remove, user.id)
-        await ctx.guild.ban(user, reason=reason, delete_message_days=0)
+
+        try:
+            await ctx.guild.ban(user, reason=reason, delete_message_days=0)
+            action_result = True
+        except Forbidden:
+            action_result = False
 
         dm_result = ":incoming_envelope: " if notified else ""
         action = f"{dm_result}:ok_hand: permanently banned {user.mention}"
@@ -205,30 +234,31 @@ class Moderation(Scheduler):
         else:
             await ctx.send(f"{action} ({reason}).")
 
-        if not notified:
-            await self.log_notify_failure(user, ctx.author, "ban")
+        dm_status = "Sent" if notified else "**Failed**"
+        log_content = None if all((notified, action_result)) else ctx.author.mention
+        title = "Member permanently banned"
+        if not action_result:
+            title += " (Failed)"
 
-        # Send a log message to the mod log
         await self.mod_log.send_log_message(
             icon_url=Icons.user_ban,
             colour=Colour(Colours.soft_red),
-            title="Member permanently banned",
+            title=title,
             thumbnail=user.avatar_url_as(static_format="png"),
             text=textwrap.dedent(f"""
                 Member: {user.mention} (`{user.id}`)
                 Actor: {ctx.message.author}
+                DM: {dm_status}
                 Reason: {reason}
-            """)
+            """),
+            content=log_content,
+            footer=f"ID {response_object['infraction']['id']}"
         )
 
     @with_role(*MODERATION_ROLES)
-    @command(name="mute")
+    @command()
     async def mute(self, ctx: Context, user: Member, *, reason: str = None):
-        """
-        Create a permanent mute infraction in the database for a user.
-        :param user: Accepts user mention, ID, etc.
-        :param reason: The reason for the mute.
-        """
+        """Create a permanent mute infraction in the database for a user."""
 
         active_mutes = await self.bot.api_client.get(
             'bot/infractions',
@@ -253,9 +283,15 @@ class Moderation(Scheduler):
         if response_object is None:
             return
 
-        # add the mute role
         self.mod_log.ignore(Event.member_update, user.id)
         await user.add_roles(self._muted_role, reason=reason)
+
+        notified = await self.notify_infraction(
+            user=user,
+            infr_type="Mute",
+            duration="Permanent",
+            reason=reason
+        )
 
         dm_result = ":incoming_envelope: " if notified else ""
         action = f"{dm_result}:ok_hand: permanently muted {user.mention}"
@@ -265,10 +301,13 @@ class Moderation(Scheduler):
         else:
             await ctx.send(f"{action} ({reason}).")
 
-        if not notified:
-            await self.log_notify_failure(user, ctx.author, "mute")
+        if notified:
+            dm_status = "Sent"
+            log_content = None
+        else:
+            dm_status = "**Failed**"
+            log_content = ctx.author.mention
 
-        # Send a log message to the mod log
         await self.mod_log.send_log_message(
             icon_url=Icons.user_mute,
             colour=Colour(Colours.soft_red),
@@ -277,8 +316,11 @@ class Moderation(Scheduler):
             text=textwrap.dedent(f"""
                 Member: {user.mention} (`{user.id}`)
                 Actor: {ctx.message.author}
+                DM: {dm_status}
                 Reason: {reason}
-            """)
+            """),
+            content=log_content,
+            footer=f"ID {response_object['infraction']['id']}"
         )
 
     # endregion
@@ -292,9 +334,10 @@ class Moderation(Scheduler):
     ):
         """
         Create a temporary mute infraction in the database for a user.
-        :param user: Accepts user mention, ID, etc.
-        :param duration: The duration for the temporary mute infraction
-        :param reason: The reason for the temporary mute.
+
+        **`user`:** Accepts user mention, ID, etc.
+        **`duration`:** The duration for the temporary mute infraction
+        **`reason`:** The reason for the temporary mute.
         """
 
         active_mutes = await self.bot.api_client.get(
@@ -342,10 +385,13 @@ class Moderation(Scheduler):
         else:
             await ctx.send(f"{action} ({reason}).")
 
-        if not notified:
-            await self.log_notify_failure(user, ctx.author, "mute")
+        if notified:
+            dm_status = "Sent"
+            log_content = None
+        else:
+            dm_status = "**Failed**"
+            log_content = ctx.author.mention
 
-        # Send a log message to the mod log
         await self.mod_log.send_log_message(
             icon_url=Icons.user_mute,
             colour=Colour(Colours.soft_red),
@@ -354,9 +400,12 @@ class Moderation(Scheduler):
             text=textwrap.dedent(f"""
                 Member: {user.mention} (`{user.id}`)
                 Actor: {ctx.message.author}
+                DM: {dm_status}
                 Reason: {reason}
                 Expires: {infraction_expiration}
-            """)
+            """),
+            content=log_content,
+            footer=f"ID {response_object['infraction']['id']}"
         )
 
     @with_role(*MODERATION_ROLES)
@@ -400,8 +449,12 @@ class Moderation(Scheduler):
 
         self.mod_log.ignore(Event.member_ban, user.id)
         self.mod_log.ignore(Event.member_remove, user.id)
-        guild: Guild = ctx.guild
-        await guild.ban(user, reason=reason, delete_message_days=0)
+
+        try:
+            await ctx.guild.ban(user, reason=reason, delete_message_days=0)
+            action_result = True
+        except Forbidden:
+            action_result = False
 
         infraction_expiration = (
             datetime
@@ -420,33 +473,39 @@ class Moderation(Scheduler):
         else:
             await ctx.send(f"{action} ({reason}).")
 
-        if not notified:
-            await self.log_notify_failure(user, ctx.author, "ban")
+        dm_status = "Sent" if notified else "**Failed**"
+        log_content = None if all((notified, action_result)) else ctx.author.mention
+        title = "Member temporarily banned"
+        if not action_result:
+            title += " (Failed)"
 
-        # Send a log message to the mod log
         await self.mod_log.send_log_message(
             icon_url=Icons.user_ban,
             colour=Colour(Colours.soft_red),
             thumbnail=user.avatar_url_as(static_format="png"),
-            title="Member temporarily banned",
+            title=title,
             text=textwrap.dedent(f"""
                 Member: {user.mention} (`{user.id}`)
                 Actor: {ctx.message.author}
+                DM: {dm_status}
                 Reason: {reason}
                 Expires: {infraction_expiration}
-            """)
+            """),
+            content=log_content,
+            footer=f"ID {response_object['infraction']['id']}"
         )
 
     # endregion
     # region: Permanent shadow infractions
 
     @with_role(*MODERATION_ROLES)
-    @command(name="shadow_warn", hidden=True, aliases=['shadowwarn', 'swarn', 'note'])
-    async def shadow_warn(self, ctx: Context, user: Union[User, proxy_user], *, reason: str = None):
+    @command(hidden=True, aliases=['shadowwarn', 'swarn', 'shadow_warn'])
+    async def note(self, ctx: Context, user: UserTypes, *, reason: str = None):
         """
-        Create a warning infraction in the database for a user.
-        :param user: accepts user mention, ID, etc.
-        :param reason: The reason for the warning.
+        Create a private infraction note in the database for a user.
+
+        **`user`:** accepts user mention, ID, etc.
+        **`reason`:** The reason for the warning.
         """
 
         response_object = await post_infraction(
@@ -457,69 +516,90 @@ class Moderation(Scheduler):
             return
 
         if reason is None:
-            result_message = f":ok_hand: note added for {user.mention}."
+            await ctx.send(f":ok_hand: note added for {user.mention}.")
         else:
-            result_message = f":ok_hand: note added for {user.mention} ({reason})."
+            await ctx.send(f":ok_hand: note added for {user.mention} ({reason}).")
 
-        await ctx.send(result_message)
-
-        # Send a message to the mod log
         await self.mod_log.send_log_message(
             icon_url=Icons.user_warn,
             colour=Colour(Colours.soft_red),
-            title="Member shadow warned",
+            title="Member note added",
             thumbnail=user.avatar_url_as(static_format="png"),
             text=textwrap.dedent(f"""
                 Member: {user.mention} (`{user.id}`)
                 Actor: {ctx.message.author}
                 Reason: {reason}
-            """)
+            """),
+            footer=f"ID {response_object['infraction']['id']}"
         )
 
     @with_role(*MODERATION_ROLES)
-    @command(name="shadow_kick", hidden=True, aliases=['shadowkick', 'skick'])
+    @command(hidden=True, aliases=['shadowkick', 'skick'])
     async def shadow_kick(self, ctx: Context, user: Member, *, reason: str = None):
         """
         Kicks a user.
-        :param user: accepts user mention, ID, etc.
-        :param reason: The reason for the kick.
+
+        **`user`:** accepts user mention, ID, etc.
+        **`reason`:** The reason for the kick.
         """
+
+        if not await self.respect_role_hierarchy(ctx, user, 'shadowkick'):
+            # Ensure ctx author has a higher top role than the target user
+            # Warning is sent to ctx by the helper method
+            return
 
         response_object = await post_infraction(ctx, user, type="kick", reason=reason, hidden=True)
         if response_object is None:
             return
 
         self.mod_log.ignore(Event.member_remove, user.id)
-        await user.kick(reason=reason)
+
+        try:
+            await user.kick(reason=reason)
+            action_result = True
+        except Forbidden:
+            action_result = False
 
         if reason is None:
-            result_message = f":ok_hand: kicked {user.mention}."
+            await ctx.send(f":ok_hand: kicked {user.mention}.")
         else:
-            result_message = f":ok_hand: kicked {user.mention} ({reason})."
+            await ctx.send(f":ok_hand: kicked {user.mention} ({reason}).")
 
-        await ctx.send(result_message)
+        title = "Member shadow kicked"
+        if action_result:
+            log_content = None
+        else:
+            log_content = ctx.author.mention
+            title += " (Failed)"
 
-        # Send a log message to the mod log
         await self.mod_log.send_log_message(
             icon_url=Icons.sign_out,
             colour=Colour(Colours.soft_red),
-            title="Member shadow kicked",
+            title=title,
             thumbnail=user.avatar_url_as(static_format="png"),
             text=textwrap.dedent(f"""
                 Member: {user.mention} (`{user.id}`)
                 Actor: {ctx.message.author}
                 Reason: {reason}
-            """)
+            """),
+            content=log_content,
+            footer=f"ID {response_object['infraction']['id']}"
         )
 
     @with_role(*MODERATION_ROLES)
-    @command(name="shadow_ban", hidden=True, aliases=['shadowban', 'sban'])
-    async def shadow_ban(self, ctx: Context, user: Union[User, proxy_user], *, reason: str = None):
+    @command(hidden=True, aliases=['shadowban', 'sban'])
+    async def shadow_ban(self, ctx: Context, user: UserTypes, *, reason: str = None):
         """
         Create a permanent ban infraction in the database for a user.
-        :param user: Accepts user mention, ID, etc.
-        :param reason: The reason for the ban.
+
+        **`user`:** Accepts user mention, ID, etc.
+        **`reason`:** The reason for the ban.
         """
+
+        if not await self.respect_role_hierarchy(ctx, user, 'shadowban'):
+            # Ensure ctx author has a higher top role than the target user
+            # Warning is sent to ctx by the helper method
+            return
 
         response_object = await post_infraction(ctx, user, type="ban", reason=reason, hidden=True)
         if response_object is None:
@@ -527,53 +607,61 @@ class Moderation(Scheduler):
 
         self.mod_log.ignore(Event.member_ban, user.id)
         self.mod_log.ignore(Event.member_remove, user.id)
-        await ctx.guild.ban(user, reason=reason, delete_message_days=0)
+
+        try:
+            await ctx.guild.ban(user, reason=reason, delete_message_days=0)
+            action_result = True
+        except Forbidden:
+            action_result = False
 
         if reason is None:
-            result_message = f":ok_hand: permanently banned {user.mention}."
+            await ctx.send(f":ok_hand: permanently banned {user.mention}.")
         else:
-            result_message = f":ok_hand: permanently banned {user.mention} ({reason})."
+            await ctx.send(f":ok_hand: permanently banned {user.mention} ({reason}).")
 
-        await ctx.send(result_message)
+        title = "Member permanently banned"
+        if action_result:
+            log_content = None
+        else:
+            log_content = ctx.author.mention
+            title += " (Failed)"
 
-        # Send a log message to the mod log
         await self.mod_log.send_log_message(
             icon_url=Icons.user_ban,
             colour=Colour(Colours.soft_red),
-            title="Member permanently banned",
+            title=title,
             thumbnail=user.avatar_url_as(static_format="png"),
             text=textwrap.dedent(f"""
                 Member: {user.mention} (`{user.id}`)
                 Actor: {ctx.message.author}
                 Reason: {reason}
-            """)
+            """),
+            content=log_content,
+            footer=f"ID {response_object['infraction']['id']}"
         )
 
     @with_role(*MODERATION_ROLES)
-    @command(name="shadow_mute", hidden=True, aliases=['shadowmute', 'smute'])
+    @command(hidden=True, aliases=['shadowmute', 'smute'])
     async def shadow_mute(self, ctx: Context, user: Member, *, reason: str = None):
         """
         Create a permanent mute infraction in the database for a user.
-        :param user: Accepts user mention, ID, etc.
-        :param reason: The reason for the mute.
+
+        **`user`:** Accepts user mention, ID, etc.
+        **`reason`:** The reason for the mute.
         """
 
         response_object = await post_infraction(ctx, user, type="mute", reason=reason, hidden=True)
         if response_object is None:
             return
 
-        # add the mute role
         self.mod_log.ignore(Event.member_update, user.id)
         await user.add_roles(self._muted_role, reason=reason)
 
         if reason is None:
-            result_message = f":ok_hand: permanently muted {user.mention}."
+            await ctx.send(f":ok_hand: permanently muted {user.mention}.")
         else:
-            result_message = f":ok_hand: permanently muted {user.mention} ({reason})."
+            await ctx.send(f":ok_hand: permanently muted {user.mention} ({reason}).")
 
-        await ctx.send(result_message)
-
-        # Send a log message to the mod log
         await self.mod_log.send_log_message(
             icon_url=Icons.user_mute,
             colour=Colour(Colours.soft_red),
@@ -583,23 +671,29 @@ class Moderation(Scheduler):
                 Member: {user.mention} (`{user.id}`)
                 Actor: {ctx.message.author}
                 Reason: {reason}
-            """)
+            """),
+            footer=f"ID {response_object['infraction']['id']}"
         )
 
     # endregion
     # region: Temporary shadow infractions
 
     @with_role(*MODERATION_ROLES)
-    @command(name="shadow_tempmute", hidden=True, aliases=["shadowtempmute, stempmute"])
-    async def shadow_tempmute(self, ctx: Context, user: Member, duration: str, *, reason: str = None):
+    @command(hidden=True, aliases=["shadowtempmute, stempmute"])
+    async def shadow_tempmute(
+        self, ctx: Context, user: Member, duration: str, *, reason: str = None
+    ):
         """
         Create a temporary mute infraction in the database for a user.
-        :param user: Accepts user mention, ID, etc.
-        :param duration: The duration for the temporary mute infraction
-        :param reason: The reason for the temporary mute.
+
+        **`user`:** Accepts user mention, ID, etc.
+        **`duration`:** The duration for the temporary mute infraction
+        **`reason`:** The reason for the temporary mute.
         """
 
-        response_object = await post_infraction(ctx, user, type="mute", reason=reason, duration=duration, hidden=True)
+        response_object = await post_infraction(
+            ctx, user, type="mute", reason=reason, duration=duration, hidden=True
+        )
         if response_object is None:
             return
 
@@ -609,17 +703,15 @@ class Moderation(Scheduler):
         infraction_object = response_object["infraction"]
         infraction_expiration = infraction_object["expires_at"]
 
-        loop = asyncio.get_event_loop()
-        self.schedule_expiration(loop, infraction_object)
+        self.schedule_expiration(ctx.bot.loop, infraction_object)
 
         if reason is None:
-            result_message = f":ok_hand: muted {user.mention} until {infraction_expiration}."
+            await ctx.send(f":ok_hand: muted {user.mention} until {infraction_expiration}.")
         else:
-            result_message = f":ok_hand: muted {user.mention} until {infraction_expiration} ({reason})."
+            await ctx.send(
+                f":ok_hand: muted {user.mention} until {infraction_expiration} ({reason})."
+            )
 
-        await ctx.send(result_message)
-
-        # Send a log message to the mod log
         await self.mod_log.send_log_message(
             icon_url=Icons.user_mute,
             colour=Colour(Colours.soft_red),
@@ -631,67 +723,89 @@ class Moderation(Scheduler):
                 Reason: {reason}
                 Duration: {duration}
                 Expires: {infraction_expiration}
-            """)
+            """),
+            footer=f"ID {response_object['infraction']['id']}"
         )
 
     @with_role(*MODERATION_ROLES)
-    @command(name="shadow_tempban", hidden=True, aliases=["shadowtempban, stempban"])
+    @command(hidden=True, aliases=["shadowtempban, stempban"])
     async def shadow_tempban(
-            self, ctx: Context, user: Union[User, proxy_user], duration: str, *, reason: str = None
+            self, ctx: Context, user: UserTypes, duration: str, *, reason: str = None
     ):
         """
         Create a temporary ban infraction in the database for a user.
-        :param user: Accepts user mention, ID, etc.
-        :param duration: The duration for the temporary ban infraction
-        :param reason: The reason for the temporary ban.
+
+        **`user`:** Accepts user mention, ID, etc.
+        **`duration`:** The duration for the temporary ban infraction
+        **`reason`:** The reason for the temporary ban.
         """
 
-        response_object = await post_infraction(ctx, user, type="ban", reason=reason, duration=duration, hidden=True)
+        if not await self.respect_role_hierarchy(ctx, user, 'shadowtempban'):
+            # Ensure ctx author has a higher top role than the target user
+            # Warning is sent to ctx by the helper method
+            return
+
+        response_object = await post_infraction(
+            ctx, user, type="ban", reason=reason, duration=duration, hidden=True
+        )
         if response_object is None:
             return
 
         self.mod_log.ignore(Event.member_ban, user.id)
         self.mod_log.ignore(Event.member_remove, user.id)
-        guild: Guild = ctx.guild
-        await guild.ban(user, reason=reason, delete_message_days=0)
+
+        try:
+            await ctx.guild.ban(user, reason=reason, delete_message_days=0)
+            action_result = True
+        except Forbidden:
+            action_result = False
 
         infraction_object = response_object["infraction"]
         infraction_expiration = infraction_object["expires_at"]
 
-        loop = asyncio.get_event_loop()
-        self.schedule_expiration(loop, infraction_object)
+        self.schedule_expiration(ctx.bot.loop, infraction_object)
 
         if reason is None:
-            result_message = f":ok_hand: banned {user.mention} until {infraction_expiration}."
+            await ctx.send(f":ok_hand: banned {user.mention} until {infraction_expiration}.")
         else:
-            result_message = f":ok_hand: banned {user.mention} until {infraction_expiration} ({reason})."
+            await ctx.send(
+                f":ok_hand: banned {user.mention} until {infraction_expiration} ({reason})."
+            )
 
-        await ctx.send(result_message)
+        title = "Member temporarily banned"
+        if action_result:
+            log_content = None
+        else:
+            log_content = ctx.author.mention
+            title += " (Failed)"
 
         # Send a log message to the mod log
         await self.mod_log.send_log_message(
             icon_url=Icons.user_ban,
             colour=Colour(Colours.soft_red),
             thumbnail=user.avatar_url_as(static_format="png"),
-            title="Member temporarily banned",
+            title=title,
             text=textwrap.dedent(f"""
                 Member: {user.mention} (`{user.id}`)
                 Actor: {ctx.message.author}
                 Reason: {reason}
                 Duration: {duration}
                 Expires: {infraction_expiration}
-            """)
+            """),
+            content=log_content,
+            footer=f"ID {response_object['infraction']['id']}"
         )
 
     # endregion
     # region: Remove infractions (un- commands)
 
     @with_role(*MODERATION_ROLES)
-    @command(name="unmute")
+    @command()
     async def unmute(self, ctx: Context, user: Member):
         """
         Deactivates the active mute infraction for a user.
-        :param user: Accepts user mention, ID, etc.
+
+        **`user`:** Accepts user mention, ID, etc.
         """
 
         try:
@@ -709,8 +823,9 @@ class Moderation(Scheduler):
 
             if not response:
                 # no active infraction
-                await ctx.send(f":x: There is no active mute infraction for user {user.mention}.")
-                return
+                return await ctx.send(
+                    f":x: There is no active mute infraction for user {user.mention}."
+                )
 
             infraction = response[0]
             await self._deactivate_infraction(infraction)
@@ -724,11 +839,16 @@ class Moderation(Scheduler):
                 icon_url=Icons.user_unmute
             )
 
-            dm_result = ":incoming_envelope: " if notified else ""
-            await ctx.send(f"{dm_result}:ok_hand: Un-muted {user.mention}.")
+            if notified:
+                dm_status = "Sent"
+                dm_emoji = ":incoming_envelope: "
+                log_content = None
+            else:
+                dm_status = "**Failed**"
+                dm_emoji = ""
+                log_content = ctx.author.mention
 
-            if not notified:
-                await self.log_notify_failure(user, ctx.author, "unmute")
+            await ctx.send(f"{dm_emoji}:ok_hand: Un-muted {user.mention}.")
 
             # Send a log message to the mod log
             await self.mod_log.send_log_message(
@@ -742,17 +862,18 @@ class Moderation(Scheduler):
                     Intended expiry: {infraction['expires_at']}
                 """)
             )
-        except Exception:
-            log.exception("There was an error removing an infraction.")
+
+        except Exception as e:
+            log.exception("There was an error removing an infraction.", exc_info=e)
             await ctx.send(":x: There was an error removing the infraction.")
-            return
 
     @with_role(*MODERATION_ROLES)
-    @command(name="unban")
-    async def unban(self, ctx: Context, user: Union[User, proxy_user]):
+    @command()
+    async def unban(self, ctx: Context, user: UserTypes):
         """
         Deactivates the active ban infraction for a user.
-        :param user: Accepts user mention, ID, etc.
+
+        **`user`:** Accepts user mention, ID, etc.
         """
 
         try:
@@ -773,8 +894,9 @@ class Moderation(Scheduler):
 
             if not response:
                 # no active infraction
-                await ctx.send(f":x: There is no active ban infraction for user {user.mention}.")
-                return
+                return await ctx.send(
+                    f":x: There is no active ban infraction for user {user.mention}."
+                )
 
             infraction = response[0]
             await self._deactivate_infraction(infraction)
@@ -798,7 +920,6 @@ class Moderation(Scheduler):
         except Exception:
             log.exception("There was an error removing an infraction.")
             await ctx.send(":x: There was an error removing the infraction.")
-            return
 
     # endregion
     # region: Edit infraction commands
@@ -926,8 +1047,7 @@ class Moderation(Scheduler):
 
         except Exception:
             log.exception("There was an error updating an infraction.")
-            await ctx.send(":x: There was an error updating the infraction.")
-            return
+            return await ctx.send(":x: There was an error updating the infraction.")
 
         # Get information about the infraction's user
         user_id = updated_infraction['user']
@@ -1036,6 +1156,7 @@ class Moderation(Scheduler):
     def schedule_expiration(self, loop: asyncio.AbstractEventLoop, infraction_object: dict):
         """
         Schedules a task to expire a temporary infraction.
+
         :param loop: the asyncio event loop
         :param infraction_object: the infraction object to expire at the end of the task
         """
@@ -1064,9 +1185,10 @@ class Moderation(Scheduler):
 
     async def _scheduled_task(self, infraction_object: dict):
         """
-        A co-routine which marks an infraction as expired after the delay from the time of scheduling
-        to the time of expiration. At the time of expiration, the infraction is marked as inactive on the website,
-        and the expiration task is cancelled.
+        A co-routine which marks an infraction as expired after the delay from the time of
+        scheduling to the time of expiration. At the time of expiration, the infraction is
+        marked as inactive on the website, and the expiration task is cancelled.
+
         :param infraction_object: the infraction in question
         """
 
@@ -1176,7 +1298,8 @@ class Moderation(Scheduler):
         return await self.send_private_embed(user, embed)
 
     async def notify_pardon(
-            self, user: Union[User, Member], title: str, content: str, icon_url: str = Icons.user_verified
+            self, user: Union[User, Member], title: str, content: str,
+            icon_url: str = Icons.user_verified
     ):
         """
         Notify a user that an infraction has been lifted.
@@ -1223,7 +1346,10 @@ class Moderation(Scheduler):
             content=actor.mention,
             colour=Colour(Colours.soft_red),
             title="Notification Failed",
-            text=f"Direct message was unable to be sent.\nUser: {target.mention}\nType: {infraction_type}"
+            text=(
+                f"Direct message was unable to be sent.\nUser: {target.mention}\n"
+                f"Type: {infraction_type}"
+            )
         )
 
     # endregion
@@ -1232,6 +1358,35 @@ class Moderation(Scheduler):
         if isinstance(error, BadUnionArgument):
             if User in error.converters:
                 await ctx.send(str(error.errors[0]))
+
+    async def respect_role_hierarchy(self, ctx: Context, target: UserTypes, infr_type: str) -> bool:
+        """
+        Check if the highest role of the invoking member is greater than that of the target member.
+        If this check fails, a warning is sent to the invoking ctx.
+
+        Returns True always if target is not a discord.Member instance.
+
+        :param ctx: The command context when invoked.
+        :param target: The target of the infraction.
+        :param infr_type: The type of infraction.
+        """
+
+        if not isinstance(target, Member):
+            return True
+
+        actor = ctx.author
+        target_is_lower = target.top_role < actor.top_role
+        if not target_is_lower:
+            log.info(
+                f"{actor} ({actor.id}) attempted to {infr_type} "
+                f"{target} ({target.id}), who has an equal or higher top role."
+            )
+            await ctx.send(
+                f":x: {actor.mention}, you may not {infr_type} "
+                "someone with an equal or higher top role."
+            )
+
+        return target_is_lower
 
 
 def setup(bot):

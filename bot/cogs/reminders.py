@@ -19,7 +19,6 @@ from bot.utils.time import humanize_delta, wait_until
 
 log = logging.getLogger(__name__)
 
-STAFF_ROLES = (Roles.owner, Roles.admin, Roles.moderator, Roles.helpers)
 WHITELISTED_CHANNELS = (Channels.bot,)
 MAXIMUM_REMINDERS = 5
 

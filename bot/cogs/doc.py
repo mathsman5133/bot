@@ -319,7 +319,7 @@ class Doc:
                 await ctx.send(embed=doc_embed)
 
     @docs_group.command(name='set', aliases=('s',))
-    @with_role(Roles.admin, Roles.owner, Roles.moderator)
+    @with_role(*MODERATION_ROLES)
     async def set_command(
         self, ctx, package_name: ValidPythonIdentifier,
         base_url: ValidURL, inventory_url: InventoryURL
@@ -363,7 +363,7 @@ class Doc:
         await ctx.send(f"Added package `{package_name}` to database and refreshed inventory.")
 
     @docs_group.command(name='delete', aliases=('remove', 'rm', 'd'))
-    @with_role(Roles.admin, Roles.owner, Roles.moderator)
+    @with_role(*MODERATION_ROLES)
     async def delete_command(self, ctx, package_name: ValidPythonIdentifier):
         """
         Removes the specified package from the database.
