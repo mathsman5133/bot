@@ -2,9 +2,10 @@ import asyncio
 import logging
 import re
 from collections import defaultdict, deque
-from time import struct_time
+from time import struct_time, strptime
 from typing import List, Optional, NamedTuple, Union
 
+from aiohttp import ClientError
 from discord import Color, Embed, Guild, Member, Message, User
 from discord.ext.commands import Bot, Context, command, group
 
@@ -13,8 +14,8 @@ from bot.constants import (
     Emojis,
     Guild as GuildConfig,
     MODERATION_ROLES,
-    Roles,
-    STAFF_ROLES
+    STAFF_ROLES,
+    URLs
 )
 from bot.decorators import with_role
 from bot.pagination import LinePaginator

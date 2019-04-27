@@ -1,6 +1,4 @@
 import logging
-import random
-import socket
 from datetime import datetime
 from ssl import CertificateError
 

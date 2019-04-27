@@ -5,7 +5,7 @@ import textwrap
 from discord import CategoryChannel, Colour, Embed, Member, TextChannel, VoiceChannel
 from discord.ext.commands import BadArgument, Bot, CommandError, Context, MissingPermissions, command
 
-from bot.constants import Emojis, Keys, MODERATION_ROLES, Roles
+from bot.constants import Channels, Emojis, Keys, MODERATION_ROLES, STAFF_ROLES
 from bot.decorators import with_role
 from bot.utils.checks import with_role_check
 from bot.utils.time import time_since
